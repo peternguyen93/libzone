@@ -10,7 +10,7 @@
 #ifndef _BLTREE_H
 #define _BLTREE_H
 
-__BEGIN_DECLS
+__BEGIN_DECLS // could be exported to C++
 struct BLNode;
 typedef struct BLNode* BLNode_t;
 
@@ -35,7 +35,7 @@ struct BLNode
 #define OBJECT_HAS_CHILD(a_object_p, bl_node_member, object_t) (BLNHEIGHT(BLTNODE_AS_OBJECT(a_object_p, bl_node_member, object_t)) > 0)
 
 BLNode_t BLTInsert(BLNode_t root, BLNode_t a_node, int (*cmp)(BLNode_t, BLNode_t));
-BLNode_t BLTDelete(BLNode_t root, BLNode_t a_node, 
+BLNode_t BLTDelete(BLNode_t root, BLNode_t a_node,
 		int (*cmp)(BLNode_t, BLNode_t), void (*deallocObject)(BLNode_t),
 		void (*swap)(BLNode_t, BLNode_t));
 BLNode_t BLTSearch(BLNode_t root, BLNode_t a_node, int (*cmp)(BLNode_t, BLNode_t));

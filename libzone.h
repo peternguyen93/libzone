@@ -10,17 +10,32 @@
 // use Balance Tree to speed up search time for duplicate hash entry
 #include "bltree.h"
 
-#define PAGE_MAPPED_MAX_THRESHOLD 3
-#define MAX_PAGE_SIZE 4096
+#ifdef DEBUG
+#define LOG(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__);
+#else
+#define LOG(fmt, ...)
+#endif
 
+#define panic(fmt, ...) do { \
+		fprintf(stderr, fmt, ##__VA_ARGS__);\
+		abort(); \
+	} while(0)
+
+#define DEFAULT_PAGE_SIZE 4096
+
+#define PAGE_MAPPED_MAX_THRESHOLD 3
 #define PAGE_MAP_MAX_BITMAP 512
-// #define MAX_INLINE_BITMAP 128
-#define MAX_NAME 64
+#define OBJECT_ALIGMENT (2 * sizeof(size_t))
+
 #define BIT_PER_BYTE sizeof(uint64_t)
 #define BIT_ARRAY_SIZE (8 * BIT_PER_BYTE)
 #define MIN_OBJECT_PER_MAP 8
+
+#define MAX_ZONE_NAME 64
+
 #define Z_ZONE_BOOTSTRAP_NAME "zone_bootstrap"
-#define Z_ZONE_BOOTSTRAP 1
+#define Z_ZONE_BOOTSTRAP 0
+#define Z_ZONE_CHILD 1
 
 #define OUTOFMEM -2
 #define MAPERR -1
@@ -29,10 +44,10 @@ struct page_mapped;
 typedef struct page_mapped* page_mapped_t;
 
 struct page_mapped {
-	size_t mapped_capacity;
-	size_t mapped_num_allocation;
-	size_t mapped_num_free;
-	size_t page_size;
+	uint32_t mapped_capacity;
+	uint32_t mapped_num_allocation;
+	uint32_t mapped_num_free;
+	uint32_t page_size;
 	void *base_address;
 	void *cur_address;
 	page_mapped_t next;
@@ -41,13 +56,13 @@ struct page_mapped {
 };
 
 struct zone {
-	char zone_name[MAX_NAME];
-	uint32_t flags;
-	size_t object_size;
-	size_t capacity;
-	size_t num_allocation;
-	size_t num_freed;
-	size_t num_page_mapped;
+	char zone_name[MAX_ZONE_NAME];
+	uint32_t flags:1;
+	uint32_t object_size; // size of each object
+	uint32_t capacity; // maximum number of objects store in this zone
+	uint32_t num_allocation; // current number of allocation object
+	uint32_t num_freed; // current number of free object
+	uint32_t num_page_mapped; // number of page mapped in this zone
 	page_mapped_t page_mapped_head; // point to head of mapped page
 	page_mapped_t page_min_num_free; // point to page has smallest number of free chunk
 	page_mapped_t page_min_num_alloc; // point to page has largest number of free chunk
@@ -59,12 +74,13 @@ struct zone {
 typedef struct zone* zone_t;
 
 struct zone_hashtable {
-	size_t capacity;
-	size_t num_zone;
+	uint32_t capacity; // size of this hashtable
+	uint32_t num_zone; // current number of zone in this hashtable
+	uint32_t page_size; // size of memory page
 	struct zone zone_bootstrap; // bootstrap zone attached in zone_hashtable to allocate a zone object
 	zone_t zones[]; // zone_array pointer
 };
-typedef struct zone_hashtable* zone_hastable_t; 
+typedef struct zone_hashtable* zone_hastable_t;
 
 extern zone_hastable_t zone_table;
 extern uint64_t        cookie[2]; // 0x10 bytes for cookie padding
@@ -72,10 +88,9 @@ extern uint64_t        cookie[2]; // 0x10 bytes for cookie padding
 #ifdef USE_ZONE_SIZE
 #define DEFAULT_ZONE_SIZE USE_ZONE_SIZE
 #else
-#define DEFAULT_ZONE_SIZE ((MAX_PAGE_SIZE - sizeof(struct zone_hashtable)) / sizeof(zone_t))
+#define DEFAULT_ZONE_SIZE ((DEFAULT_PAGE_SIZE - sizeof(struct zone_hashtable)) / sizeof(zone_t))
 #endif
 
-// #define PAGE_NEXT_CHUNK(pagep, object_size) (void *)((uint8_t *)pagep->cur_address + object_size * )
 #define PAGEMAP_INIT_HEAD(zone, pagep) do {\
 		zone->page_mapped_head       = pagep;\
 		zone->page_mapped_head->next = zone->page_mapped_head;\
@@ -119,8 +134,8 @@ extern uint64_t        cookie[2]; // 0x10 bytes for cookie padding
 
 __BEGIN_DECLS
 
-void  zone_create(const char *zone_name, size_t object_size); // create a new zone for specific object
-void* zone_alloc(const char *zone_name); // alloc a new object 
+void  zone_create(const char *zone_name, uint32_t object_size); // create a new zone for specific object
+void* zone_alloc(const char *zone_name); // alloc a new object
 void  zone_free(const char *zone_name, void *ptr); // free an object
 
 #ifdef DEBUG

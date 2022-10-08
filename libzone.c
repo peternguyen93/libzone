@@ -15,34 +15,32 @@
 
 zone_hastable_t zone_table;
 uint64_t        cookie[2];
-pthread_mutex_t gc_lock;
 
-#define LOG(fmt, ...) fprintf(stderr, fmt, ##__VA_ARGS__);
-#define panic(fmt, ...) do { \
-			fprintf(stderr, fmt, ##__VA_ARGS__);\
-			abort(); \
-		} while(0)
+// thread-safe implement for zone_hastable_t
+pthread_mutex_t zone_table_lck;
 
 void constructor() __attribute__((constructor));
 void destructor() __attribute__((destructor));
 
 void zone_table_init();
 void zone_table_deinit();
-void zone_init(zone_t zone, const char *zone_name, size_t object_size, uint8_t is_mapped);
+
+void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, uint8_t is_mapped);
 void zone_destroy(zone_t zonep);
 
-void zone_create_internal(const char *zone_name, size_t object_size, uint8_t is_mapped);
+void zone_create_internal(const char *zone_name, uint32_t object_size, uint8_t is_mapped);
 void* zone_alloc_internal(const char *zone_name);
 void zone_free_internal(const char *zone_name, void *ptr);
 
-size_t round_up(size_t size, size_t base)
+static inline size_t round_up(size_t size, size_t base)
 {
 	return size % base == 0 ? size : base + (size / base) * base;
 }
 
 #define CHUNK_COOKIE_PTR(chunkptr, object_size) (void *)((uint8_t *)chunkptr + object_size)
-#define PAGEMAP_COOKIE_PTR(pagep) (void *)((uint8_t *)pagep + sizeof(struct page_mapped) + \
-							round_up(pagep->mapped_capacity, BIT_ARRAY_SIZE) / BIT_PER_BYTE)
+#define PAGEMAP_COOKIE_PTR(pagep) \
+	(void *)((uint8_t *)pagep + \
+		round_up(sizeof(struct page_mapped) + round_up(pagep->mapped_capacity, BIT_ARRAY_SIZE) / BIT_PER_BYTE, 2 * sizeof(size_t)))
 
 #define BLNODE_AS_ZONE(bl_node_p) BLTNODE_AS_OBJECT(bl_node_p, blnode, struct zone)
 #define ZONE_AS_BLNODE(zonep)  OBJECT_AS_BLTNODE(zonep, blnode, struct zone)
@@ -128,14 +126,14 @@ void destructor()
 	zone_table_deinit();
 }
 
-size_t hash_string(const char *str)
+static inline size_t hash_string(const char *str)
 {
 	// hash calulation for zone_name
 	size_t hash = 0;
 	char *p;
 	int i;
 
-	for(i = 0, p = (char *)str; (p[0] != '\x00') && (i < MAX_NAME); p++, i++){
+	for(i = 0, p = (char *)str; (p[0] != '\x00') && (i < MAX_ZONE_NAME); p++, i++){
 		hash += ((size_t)p[0]) * (10*(i + 1));
 	}
 	return hash;
@@ -189,10 +187,10 @@ zone_t zone_table_get_zone(const char * zone_name)
 
 page_mapped_t map_new_page(size_t object_size)
 {
-	size_t page_size;
-	size_t n_object;
-	size_t nbit_map;
-	size_t size_page_mapped;
+	uint32_t page_size;
+	uint32_t n_object;
+	uint32_t nbit_map;
+	uint32_t size_page_mapped;
 	page_mapped_t new_page;
 
 	nbit_map = 0;
@@ -202,18 +200,18 @@ page_mapped_t map_new_page(size_t object_size)
 	else if(object_size > 8192)
 		n_object = 1;
 	else {
-		n_object = MAX_PAGE_SIZE / object_size;
+		n_object = DEFAULT_PAGE_SIZE / object_size;
 		if(n_object < MIN_OBJECT_PER_MAP)
 			n_object = MIN_OBJECT_PER_MAP;
 	}
 
 	nbit_map = round_up(n_object, BIT_ARRAY_SIZE) / BIT_PER_BYTE;
-	size_page_mapped = sizeof(struct page_mapped) + nbit_map;
+	size_page_mapped = round_up(sizeof(struct page_mapped) + nbit_map, OBJECT_ALIGMENT);
 #ifdef USECOOKIE
 	size_page_mapped += sizeof(cookie);
 #endif
 
-	page_size = round_up(size_page_mapped + n_object * object_size, MAX_PAGE_SIZE);
+	page_size = round_up(size_page_mapped + n_object * object_size, DEFAULT_PAGE_SIZE);
 	new_page = (page_mapped_t)mmap(NULL, page_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
 	if((int64_t)new_page == -1){
 		return NULL;
@@ -248,7 +246,7 @@ int page_unmap_page(page_mapped_t unmap_page, size_t object_size)
 
 #ifdef USEZMALLOC
 
-#define MAX_MALLOC_SIZE_NAME (MAX_PAGE_SIZE * 2)/MIN_CHUNK_SIZE
+#define MAX_MALLOC_SIZE_NAME (DEFAULT_PAGE_SIZE * 2)/MIN_CHUNK_SIZE
 #define MAX_MALLOC_NAME_LEN 64
 static char zmalloc_zone_name[MAX_MALLOC_SIZE_NAME][MAX_MALLOC_NAME_LEN];
 
@@ -266,8 +264,8 @@ void zmalloc_init()
 
 void zone_table_init()
 {
-	size_t map_size = round_up(sizeof(struct zone_hashtable) + DEFAULT_ZONE_SIZE * sizeof(zone_t), MAX_PAGE_SIZE);
-	size_t zone_object_size;
+	uint32_t map_size = round_up(sizeof(struct zone_hashtable) + DEFAULT_ZONE_SIZE * sizeof(zone_t), DEFAULT_PAGE_SIZE);
+	uint32_t zone_object_size;
 
 	if(zone_table)
 		return;
@@ -278,13 +276,11 @@ void zone_table_init()
 	}
 
 	bzero((void *)zone_table, map_size);
+	zone_table->page_size = map_size;
 	zone_table->capacity = DEFAULT_ZONE_SIZE;
 	zone_table->num_zone = 0;
 
 	zone_object_size = sizeof(struct zone);
-#ifdef USECOOKIE
-	zone_object_size += sizeof(cookie);
-#endif
 
 	zone_init(&(zone_table->zone_bootstrap), Z_ZONE_BOOTSTRAP_NAME, zone_object_size, 0);
 #ifdef USEZMALLOC
@@ -295,7 +291,7 @@ void zone_table_init()
 void zone_table_deinit()
 {
 	int i;
-	size_t page_size = 0;
+	uint32_t page_size = 0;
 	zone_t zonep;
     zone_t bootstrap_zonep = NULL;
 	page_mapped_t page_p;
@@ -320,7 +316,7 @@ void zone_table_deinit()
 	zone_destroy(&(zone_table->zone_bootstrap));
 
 clear_zone_table:
-	page_size = round_up(sizeof(struct zone_hashtable) + DEFAULT_ZONE_SIZE * sizeof(struct zone), MAX_PAGE_SIZE);
+	page_size = zone_table->page_size;
 	ret = munmap(zone_table, page_size);
 	if(ret < 0){
 		panic("Unable to mumap zone_table\n");
@@ -329,7 +325,7 @@ clear_zone_table:
 	zone_table = NULL;
 }
 
-void zone_init(zone_t zone, const char *zone_name, size_t object_size, uint8_t is_mapped)
+void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, uint8_t is_mapped)
 {
 	page_mapped_t new_page;
 
@@ -337,7 +333,13 @@ void zone_init(zone_t zone, const char *zone_name, size_t object_size, uint8_t i
 		strncpy(zone->zone_name, zone_name, sizeof(zone->zone_name) - 1);
 	}
 
-	if(object_size > MAX_PAGE_SIZE * 8){
+	object_size = round_up(object_size, OBJECT_ALIGMENT);
+#ifdef USECOOKIE
+	// use secure cookie
+	object_size+= sizeof(cookie);
+#endif
+
+	if(object_size > DEFAULT_PAGE_SIZE * 8){
 		panic("Object is too large\n");
 	}
 
@@ -354,14 +356,14 @@ void zone_init(zone_t zone, const char *zone_name, size_t object_size, uint8_t i
 		zone->num_page_mapped = 1;
 		PAGEMAP_INIT_HEAD(zone, new_page);
 	}
-	
+
 	zone->num_allocation = 0;
 	zone->num_freed = 0;
 	zone->page_min_num_free = NULL;
 	zone->page_min_num_alloc = NULL;
 }
 
-void zone_create_internal(const char *zone_name, size_t object_size, uint8_t is_mapped)
+void zone_create_internal(const char *zone_name, uint32_t object_size, uint8_t is_mapped)
 {
 	zone_t zone, d_zone = NULL;
 	uint32_t idx = 0;
@@ -387,7 +389,7 @@ void zone_create_internal(const char *zone_name, size_t object_size, uint8_t is_
 	
 	bzero((void *)d_zone, sizeof(struct zone));
 	strncpy(d_zone->zone_name, zone_name, sizeof(zone->zone_name) - 1);
-	d_zone->flags |= Z_ZONE_BOOTSTRAP;
+	d_zone->flags |= Z_ZONE_CHILD;
 
 	if(zone) {
 		// zone index is duplicate , insert d_zone into balance tree of this zone entry
@@ -398,17 +400,11 @@ void zone_create_internal(const char *zone_name, size_t object_size, uint8_t is_
 		zone_table->num_zone++;
 	}
 
-    // initialize attributes for this new zone
-#ifdef USECOOKIE
-	// use secure cookie
-	object_size += sizeof(cookie);
-#endif
-
 	zone_init(d_zone, NULL, object_size, is_mapped);
 }
 
 
-void zone_create(const char *zone_name, size_t object_size)
+void zone_create(const char *zone_name, uint32_t object_size)
 {
 	if(strncmp(zone_name, Z_ZONE_BOOTSTRAP_NAME, sizeof(Z_ZONE_BOOTSTRAP_NAME)) == 0){
 		panic("Invalid zone name\n");
@@ -437,7 +433,7 @@ void zone_destroy(zone_t zonep)
 	zone_flags = zonep->flags;
 	bzero((void *)zonep, sizeof(struct zone));
 
-	if(zone_flags & Z_ZONE_BOOTSTRAP){
+	if(zone_flags & Z_ZONE_CHILD){
 		// free a zone was created in zone_bootstrap
 		zone_free_internal(Z_ZONE_BOOTSTRAP_NAME, zonep);
 	}
@@ -457,8 +453,8 @@ void *zone_alloc_internal(const char *zone_name)
 	zone_t zone = NULL;
 	void * ret_ptr = NULL;
 	page_mapped_t pagep;
-	size_t chunk_idx;
-	size_t num_free_max;
+	uint32_t chunk_idx;
+	uint32_t num_free_max;
 	uint32_t idx, bit_idx;
 
 	zone = zone_table_get_zone(zone_name);
@@ -515,7 +511,7 @@ return_new_pointer:
 	/* Use freed chunks */
 
 	assert(zone->num_freed != 0);
-	
+
 	if(!zone->page_min_num_free || zone->page_min_num_free->mapped_num_free){
 		// search for freed chunk
 		pagep = PAGEMAP_HEAD(zone);
@@ -550,7 +546,7 @@ return_new_pointer:
 	bit_idx = chunk_idx % BIT_ARRAY_SIZE;
 	if(BIT64_IS_NOT_SET(pagep->bitmap[idx], bit_idx)){
 		// corrupted bitmap
-		panic("This chunk index %ld was corrupted zone %s\n", chunk_idx, zone->zone_name);
+		panic("This chunk index %d was corrupted zone %s\n", chunk_idx, zone->zone_name);
 	}
 
 	BIT64_CLEAR(pagep->bitmap[idx], bit_idx);// mark this chunk was allocated
@@ -565,8 +561,8 @@ return_new_pointer:
 	if(zone->page_min_num_free->mapped_num_free == 0){
 		zone->page_min_num_free = NULL;
 	}
-	
-	return ret_ptr; 
+
+	return ret_ptr;
 }
 
 void zone_free(const char *zone_name, void *ptr)
@@ -601,7 +597,7 @@ void zone_free_internal(const char *zone_name, void *ptr)
 			panic("Corrupted `pagep` of zone %s\n", zone->zone_name);
 		}
 #endif
-		end_address = round_up((size_t)pagep->base_address + pagep->mapped_capacity * zone->object_size, MAX_PAGE_SIZE);
+		end_address = round_up((size_t)pagep->base_address + pagep->mapped_capacity * zone->object_size, DEFAULT_PAGE_SIZE);
 		base_address = (size_t)pagep->base_address;
 		if(base_address <= (size_t)ptr && (size_t)ptr < end_address){
 			is_valid = 1;
@@ -740,50 +736,6 @@ void zfree(void *ptr, size_t ptr_size)
 }
 #endif
 
-#ifdef ZMALLOC_GC
-#define SLEEP_TIME 2 * 60 // sleep for 2 minutes
-
-void zmalloc_walk_callback(BLNode_t node_p)
-{
-	zone_t zonep;
-	page_mapped_t pagep;
-
-	if(!node_p)
-		return;
-
-	zonep = ZONE_AS_BLNODE(node_p);
-	// skip bootstrap zone
-	if(!zonep || strcmp(zonep->zone_name, Z_ZONE_BOOTSTRAP_NAME) == 0)
-		return;
-
-	// walk through each mapped page in zonep to collect.
-	
-}
-
-void zmalloc_thread_gc(void)
-{
-	zone_t zone_root_p;
-	
-	// a loop to collect all ununsed page
-	for(;;)
-	{
-		// sleep for a few second
-		sleep(SLEEP_TIME);
-
-		// walk for mapped page in all zones to unmap ununsed page
-		pthread_mutex_lock(lock_gc);
-
-		for(int i = 0; i < zone_table->capacity; i++){
-			zone_root_p = zone_table->zones[i];
-			BLTWalk(BLNODE_AS_ZONE(zone_root_p), zmalloc_walk_callback);
-		}
-
-		pthread_mutex_unlock(lock_gc);
-	}
-}
-
-#endif
-
 #ifdef DEBUG
 void bltree_zone_print_short(BLNode_t a_node)
 {
@@ -798,11 +750,11 @@ void bltree_zone_print_short(BLNode_t a_node)
 
 	printf("=============================\n");
 	printf("Zone: %s\n", zone->zone_name);
-	printf("object_size: %ld\n", zone->object_size);
-	printf("capacity: %ld\n", zone->capacity);
-	printf("num_allocation: %ld\n", zone->num_allocation);
-	printf("num_freed: %ld\n", zone->num_freed);
-	printf("num_page_mapped: %ld\n", zone->num_page_mapped);
+	printf("object_size: %d\n", zone->object_size);
+	printf("capacity: %d\n", zone->capacity);
+	printf("num_allocation: %d\n", zone->num_allocation);
+	printf("num_freed: %d\n", zone->num_freed);
+	printf("num_page_mapped: %d\n", zone->num_page_mapped);
 }
 
 void zone_list2()
@@ -825,20 +777,20 @@ void zone_list()
 		zone = zone_table->zones[i];
 
 		printf("Zone: %s\n", zone->zone_name);
-		printf("object_size: %ld\n", zone->object_size);
-		printf("capacity: %ld\n", zone->capacity);
-		printf("num_allocation: %ld\n", zone->num_allocation);
-		printf("num_freed: %ld\n", zone->num_freed);
-		printf("num_page_mapped: %ld\n", zone->num_page_mapped);
+		printf("object_size: %d\n", zone->object_size);
+		printf("capacity: %d\n", zone->capacity);
+		printf("num_allocation: %d\n", zone->num_allocation);
+		printf("num_freed: %d\n", zone->num_freed);
+		printf("num_page_mapped: %d\n", zone->num_page_mapped);
 		printf("page_mapped:\n");
 
 		pagep = PAGEMAP_HEAD(zone);
 		do {
 			printf("-----------------------------------------------\n");
-			printf("\tcapacity: %ld\n",       pagep->mapped_capacity);
+			printf("\tcapacity: %d\n",       pagep->mapped_capacity);
 			printf("\tbase_address: %p\n",    pagep->base_address);
-			printf("\tnum_allocation: %ld\n", pagep->mapped_num_allocation);
-			printf("\tnum_free: %ld\n",       pagep->mapped_num_free);
+			printf("\tnum_allocation: %d\n", pagep->mapped_num_allocation);
+			printf("\tnum_free: %d\n",       pagep->mapped_num_free);
 			printf("\tbitmap: ");
 			for(k = 0; k < round_up(pagep->mapped_capacity, BIT_ARRAY_SIZE) / BIT_ARRAY_SIZE; k++){
 				printf("%lld ", pagep->bitmap[k]);

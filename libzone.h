@@ -78,7 +78,7 @@ struct zone_hashtable {
 	uint32_t num_zone; // current number of zone in this hashtable
 	uint32_t page_size; // size of memory page
 	struct zone zone_bootstrap; // bootstrap zone attached in zone_hashtable to allocate a zone object
-	zone_t zones[]; // zone_array pointer
+	zone_t zones[]; // array of zone_t pointer
 };
 typedef struct zone_hashtable* zone_hastable_t;
 

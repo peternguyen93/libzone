@@ -25,10 +25,10 @@ void destructor() __attribute__((destructor));
 void zone_table_init();
 void zone_table_deinit();
 
-void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, uint8_t is_mapped);
+void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, bool is_mapped);
 void zone_destroy(zone_t zonep);
 
-void zone_create_internal(const char *zone_name, uint32_t object_size, uint8_t is_mapped);
+void zone_create_internal(const char *zone_name, uint32_t object_size, bool is_mapped);
 void* zone_alloc_internal(const char *zone_name);
 void zone_free_internal(const char *zone_name, void *ptr);
 
@@ -195,11 +195,13 @@ page_mapped_t map_new_page(size_t object_size)
 
 	nbit_map = 0;
 
-	if (object_size > 4096 && page_size < 8192)
-		n_object = 2;
-	else if(object_size > 8192)
-		n_object = 1;
+	// calculate how many pages need for object_size
+	if (object_size > DEFAULT_PAGE_SIZE && page_size < DEFAULT_PAGE_SIZE * 2)
+		n_object = 8;
+	else if(object_size >= DEFAULT_PAGE_SIZE * 2)
+		n_object = 4;
 	else {
+		// object size is less than PAGE_SIZE
 		n_object = DEFAULT_PAGE_SIZE / object_size;
 		if(n_object < MIN_OBJECT_PER_MAP)
 			n_object = MIN_OBJECT_PER_MAP;
@@ -228,7 +230,7 @@ page_mapped_t map_new_page(size_t object_size)
 	return new_page;
 }
 
-int page_unmap_page(page_mapped_t unmap_page, size_t object_size)
+bool page_unmap_page(page_mapped_t unmap_page)
 {
 	size_t page_size;
 
@@ -241,7 +243,7 @@ int page_unmap_page(page_mapped_t unmap_page, size_t object_size)
 	page_size = unmap_page->page_size;
 	assert(page_size != 0);
 
-	return munmap((void *)unmap_page, page_size);
+	return munmap((void *)unmap_page, page_size) != -1;
 }
 
 #ifdef USEZMALLOC
@@ -257,9 +259,12 @@ void zmalloc_init()
 	for(int i = 0; i < ZMALLOC_SIZE_ARRAY_LENGTH; i++){
 		zmalloc_size = zmalloc_size_array[i];
 		snprintf(zmalloc_zone_name[i], MAX_MALLOC_NAME_LEN, "zmalloc.%d", zmalloc_size);
-		zone_create_internal(zmalloc_zone_name[i], zmalloc_size, 0);
+#ifdef ZMALLOC_INIT_FIRST
+		zone_create_internal(zmalloc_zone_name[i], zmalloc_size, false);
+#endif
 	}
 }
+
 #endif
 
 void zone_table_init()
@@ -325,7 +330,7 @@ clear_zone_table:
 	zone_table = NULL;
 }
 
-void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, uint8_t is_mapped)
+void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, bool is_mapped)
 {
 	page_mapped_t new_page;
 
@@ -363,7 +368,7 @@ void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, uint8_t
 	zone->page_min_num_alloc = NULL;
 }
 
-void zone_create_internal(const char *zone_name, uint32_t object_size, uint8_t is_mapped)
+void zone_create_internal(const char *zone_name, uint32_t object_size, bool is_mapped)
 {
 	zone_t zone, d_zone = NULL;
 	uint32_t idx = 0;
@@ -410,7 +415,7 @@ void zone_create(const char *zone_name, uint32_t object_size)
 		panic("Invalid zone name\n");
 	}
 
-	zone_create_internal(zone_name, object_size, 0);
+	zone_create_internal(zone_name, object_size, false);
 }
 
 void zone_destroy(zone_t zonep)
@@ -421,13 +426,13 @@ void zone_destroy(zone_t zonep)
 	if(PAGEMAP_HEAD(zonep)){
 		page_p = PAGEMAP_TAIL(zonep);//zonep->page_mapped_head->prev;
 		// unmap all mapped-page in this zone
-		do{
+		do {
 			unmap_page = page_p;
 			page_p = page_p->prev;
-			if(page_unmap_page(unmap_page, zonep->object_size) < 0){
+			if(!page_unmap_page(unmap_page)){
 				panic("Unable to mumap base_address of zone %s\n", zonep->zone_name);
 			}
-		}while(page_p != PAGEMAP_HEAD(zonep));
+		} while(page_p != PAGEMAP_HEAD(zonep));
 	}
 
 	zone_flags = zonep->flags;
@@ -582,7 +587,7 @@ void zone_free_internal(const char *zone_name, void *ptr)
 	uint32_t idx, bit_idx;
 	page_mapped_t pagep;
 	page_mapped_t pagep_min_num_free;
-	uint8_t is_valid = 0;
+	bool is_valid = false;
 
 	zone = zone_table_get_zone(zone_name);
 	if(!zone){
@@ -593,14 +598,16 @@ void zone_free_internal(const char *zone_name, void *ptr)
 	pagep = PAGEMAP_HEAD(zone);
 	do {
 #ifdef USECOOKIE
+		// verify page_map cookie
 		if(memcmp(PAGEMAP_COOKIE_PTR(pagep), (void *)&cookie, sizeof(cookie)) != 0){
 			panic("Corrupted `pagep` of zone %s\n", zone->zone_name);
 		}
 #endif
-		end_address = round_up((size_t)pagep->base_address + pagep->mapped_capacity * zone->object_size, DEFAULT_PAGE_SIZE);
+		end_address = (size_t)((size_t)pagep + pagep->page_size);
 		base_address = (size_t)pagep->base_address;
+		// validate `ptr`
 		if(base_address <= (size_t)ptr && (size_t)ptr < end_address){
-			is_valid = 1;
+			is_valid = true;
 			break;
 		}
 
@@ -611,11 +618,13 @@ void zone_free_internal(const char *zone_name, void *ptr)
 		panic("Invalid pointer: %p", ptr);
 	}
 
+	// validate pointer alignment
 	if (((size_t)ptr - (size_t)base_address) % zone->object_size){
 		panic("Invalid pointer: %p", ptr);
 	}
 
 #ifdef USECOOKIE
+	// check cookie
 	if(memcmp(CHUNK_COOKIE_PTR(ptr, zone->object_size - sizeof(cookie)), \
 											(void *)&cookie, sizeof(cookie)) != 0){
 		panic("Corrupted chunk: %p\n", ptr);
@@ -625,10 +634,11 @@ void zone_free_internal(const char *zone_name, void *ptr)
 	chunk_idx = ((size_t)ptr - (size_t)base_address) / zone->object_size;
 	idx = chunk_idx / BIT_ARRAY_SIZE;
 	bit_idx = chunk_idx % BIT_ARRAY_SIZE;
+	// check bitmap
 	if (BIT64_IS_SET(pagep->bitmap[idx], bit_idx)){
 		panic("Zone: %s  - Double free corrution!!", zone->zone_name);
 	}
-	BIT64_SET(pagep->bitmap[idx], bit_idx); // mark this chunk was freed
+	BIT64_SET(pagep->bitmap[idx], bit_idx); // mark this chunk is freed
 
 	pagep->mapped_num_allocation--;
 	pagep->mapped_num_free++;
@@ -661,17 +671,17 @@ void zone_free_internal(const char *zone_name, void *ptr)
 		if(pagep == zone->page_min_num_alloc)
 			zone->page_min_num_alloc = NULL;
 
-		assert(page_unmap_page(pagep, zone->object_size) >= 0);
+		assert(page_unmap_page(pagep));
 
 		if(!zone->page_min_num_alloc){
 			// search for new ptr page_min_num_alloc
 			pagep = PAGEMAP_HEAD(zone);
-			do{
+			do {
 				if(pagep->mapped_num_allocation < pagep->mapped_capacity){
 					zone->page_min_num_alloc = pagep;
 				}
 				pagep = pagep->next;
-			}while(pagep->next != PAGEMAP_HEAD(zone));
+			} while(pagep->next != PAGEMAP_HEAD(zone));
 		}
 	}
 }
@@ -708,10 +718,17 @@ void* zmalloc(size_t size)
 {
 	uint64_t malloc_size;
 	char *zmalloc_zone_name = NULL;
+	zone_t zone = NULL;
 
 	if(zmalloc_get_zone_name((uint64_t)size, &malloc_size, &zmalloc_zone_name) == E_BIG){
 		LOG("zmalloc size is tool big\n");
 		return NULL;
+	}
+
+	zone = zone_table_get_zone(zmalloc_zone_name);
+	if(!zone){
+		// this zmalloc_zone_name wasn't allocated, then allocate it
+		zone_create(zmalloc_zone_name, malloc_size);
 	}
 
 	return zone_alloc_internal(zmalloc_zone_name);

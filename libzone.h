@@ -151,6 +151,7 @@ const uint32_t zmalloc_size_array[] = {16, 32, 48, 64, 80, 96, 128, 160, 192, 25
 
 void* zmalloc(size_t size);
 void* zcalloc(size_t count, size_t object_size);
+void* zrealloc(void *old_ptr, size_t old_size, size_t size);
 void  zfree(void *ptr, size_t ptr_size);
 #endif
 

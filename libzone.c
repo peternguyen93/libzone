@@ -17,7 +17,11 @@ zone_hastable_t zone_table;
 uint64_t        cookie[2];
 
 // thread-safe implement for zone_hastable_t
-pthread_mutex_t zone_table_lck;
+pthread_mutex_t zone_access_lck;
+
+#define ZONE_LCK_INIT pthread_mutex_init(&zone_access_lck, NULL)
+#define ZONE_LCK   pthread_mutex_lock(&zone_access_lck)
+#define ZONE_UNLCK pthread_mutex_unlock(&zone_access_lck)
 
 void constructor() __attribute__((constructor));
 void destructor() __attribute__((destructor));
@@ -117,6 +121,8 @@ void constructor()
 	}
 	cookie[0] &= 0xFFFFFFFFFFFFFF00; // avoid leakage cookie
 #endif
+
+	ZONE_LCK_INIT; // init mutex lock
 	// initialize zone_table when this shared library is loaded
 	zone_table_init();
 }
@@ -303,6 +309,8 @@ void zone_table_deinit()
 	page_mapped_t unmap_page;
 	int ret;
 
+	ZONE_LCK; // make sure there are not operation in zone_table
+
 	if(!zone_table)
 		return;
 	
@@ -328,6 +336,8 @@ clear_zone_table:
 	}
 
 	zone_table = NULL;
+
+	ZONE_UNLCK;
 }
 
 void zone_init(zone_t zone, const char *zone_name, uint32_t object_size, bool is_mapped)
@@ -411,11 +421,13 @@ void zone_create_internal(const char *zone_name, uint32_t object_size, bool is_m
 
 void zone_create(const char *zone_name, uint32_t object_size)
 {
+	ZONE_LCK;
 	if(strncmp(zone_name, Z_ZONE_BOOTSTRAP_NAME, sizeof(Z_ZONE_BOOTSTRAP_NAME)) == 0){
 		panic("Invalid zone name\n");
 	}
 
 	zone_create_internal(zone_name, object_size, false);
+	ZONE_UNLCK;
 }
 
 void zone_destroy(zone_t zonep)
@@ -462,6 +474,8 @@ void *zone_alloc_internal(const char *zone_name)
 	uint32_t num_free_max;
 	uint32_t idx, bit_idx;
 
+	ZONE_LCK;
+
 	zone = zone_table_get_zone(zone_name);
 	if(!zone){
 		panic("Invalid zone: %s\n", zone_name);
@@ -480,7 +494,7 @@ void *zone_alloc_internal(const char *zone_name)
 #endif
 
 			if(pagep->mapped_num_allocation + 1 < pagep->mapped_capacity){
-return_new_pointer:
+alloc_new_pointer:
 				ret_ptr = pagep->cur_address;
 				pagep->cur_address = (void *)((size_t)pagep->cur_address + zone->object_size);
 #ifdef USECOOKIE
@@ -489,7 +503,7 @@ return_new_pointer:
 #endif
 				pagep->mapped_num_allocation++;
 				zone->num_allocation++;
-				return ret_ptr;
+				goto return_ptr;
 			}
 		}
 
@@ -510,7 +524,7 @@ return_new_pointer:
 		}
 
 		zone->page_min_num_alloc = pagep; // best page to mark min_num_alloc
-		goto return_new_pointer;
+		goto alloc_new_pointer;
 	}
 
 	/* Use freed chunks */
@@ -567,6 +581,8 @@ return_new_pointer:
 		zone->page_min_num_free = NULL;
 	}
 
+return_ptr:
+	ZONE_UNLCK;
 	return ret_ptr;
 }
 
@@ -588,6 +604,8 @@ void zone_free_internal(const char *zone_name, void *ptr)
 	page_mapped_t pagep;
 	page_mapped_t pagep_min_num_free;
 	bool is_valid = false;
+
+	ZONE_LCK;
 
 	zone = zone_table_get_zone(zone_name);
 	if(!zone){
@@ -684,6 +702,8 @@ void zone_free_internal(const char *zone_name, void *ptr)
 			} while(pagep->next != PAGEMAP_HEAD(zone));
 		}
 	}
+
+	ZONE_UNLCK;
 }
 
 #ifdef USEZMALLOC
@@ -725,7 +745,10 @@ void* zmalloc(size_t size)
 		return NULL;
 	}
 
+	ZONE_LCK;
 	zone = zone_table_get_zone(zmalloc_zone_name);
+	ZONE_UNLCK;
+
 	if(!zone){
 		// this zmalloc_zone_name wasn't allocated, then allocate it
 		zone_create(zmalloc_zone_name, malloc_size);
@@ -737,6 +760,22 @@ void* zmalloc(size_t size)
 void *zcalloc(size_t count, size_t size)
 {
 	return zmalloc(count * size);
+}
+
+void *zrealloc(void *old_ptr, size_t old_size, size_t new_size)
+{
+	void *new_ptr = NULL;
+
+	if(!old_ptr)
+		return NULL;
+
+	new_ptr = zmalloc(new_size);
+	if(!new_ptr)
+		return NULL;
+
+	memcpy(new_ptr, old_ptr, old_size);
+	zfree(old_ptr, old_size);
+	return new_ptr;
 }
 
 void zfree(void *ptr, size_t ptr_size)
